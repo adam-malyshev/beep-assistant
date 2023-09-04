@@ -1,0 +1,7 @@
+gTTS
+openai
+protobuf
+pvporcupine
+PyAudio
+google-cloud-texttospeech
+python-dotenv
