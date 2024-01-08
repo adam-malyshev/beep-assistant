@@ -14,10 +14,10 @@ import audioop
 import io
 import os
 import dotenv
-
+import traceback
 class Beep:
 
-    def __init__(self, input_device_index=None, output_device_index=None, lang="en", dBthreshold=60):
+    def __init__(self, input_device_index=None, output_device_index=None, lang="en", dBthreshold=10):
         ACCESS_KEY = "uB/jLDdUQ96x8ha/8w/Yq71qUFo61ByJcfvQqJirOnbAKoq62tW+Tg==" 
         KEYWORDS = ["/home/beep/beep-assistant/wake/Sunshine.ppn", "/home/beep/beep-assistant/wake/HeyBeep.ppn"]
         self.porcupine = pvporcupine.create(access_key=ACCESS_KEY, keyword_paths=KEYWORDS)
@@ -44,7 +44,7 @@ class Beep:
                         output=True,
                         output_device_index=self.output_device_index)
 
-        self.thread = mp.Process(target=self._collect_data) 
+        self.thread = mp.Process(name='_collect_data', target=self._collect_data) 
         self.frames = mp.Queue()
         self.voices =  {
             "en":"en-GB-Neural2-D",
@@ -52,11 +52,14 @@ class Beep:
         }
         self.logger = mp.log_to_stderr()
         self.logger.setLevel(logging.INFO)
-        self.dBthreshold = dBthreshold
         self.temp_file = "/home/beep/beep-assistant/audio/input.wav"
         self.name = "Beep"
         self.lang = lang
         self.SSML = True
+        self.max_input_seconds=20
+        self.speech_buffer_seconds=5
+        self.dBthreshold= dBthreshold
+        self.detectionVolume= 50 + self.dBthreshold
     def get(self):
         return self.frames.get()
     def empty(self):
@@ -65,18 +68,32 @@ class Beep:
         return self.frames.full()
     def put(self, data):
         self.frames.put(data)
+    def length(self):
+        return self.frames.qsize()
     def volume(self, audio_data):
         rms = audioop.rms(audio_data, 2)
         if rms > 0:
             dB = 20 * math.log10(rms)
         else:
             dB = 0
-        #print("dB: ",dB)
+        #self.logger.info("dB: ",dB)
         return dB 
     
     def isSpeech(self, audio_data):
-        return self.volume(audio_data) > self.dBthreshold
+        return self.volume(audio_data) > self.detectionVolume
     
+    def avg_volume(self, seconds):
+        sum_vol =  self.volume(self.stream.read(self.CHUNK, exception_on_overflow = False))
+        start = datetime.utcnow()
+        now = start
+        i = 1
+        while (now - start) < timedelta(seconds= seconds):
+            now = datetime.utcnow()
+            i += 1
+            sum_vol += self.volume(self.stream.read(self.CHUNK, exception_on_overflow = False))
+        return sum_vol/i
+
+
     def start(self):
         self.thread.start()
     
@@ -84,39 +101,51 @@ class Beep:
         self.thread.terminate()
 
     def _collect_data(self):
-        print("called")
+        self.logger.info("called")
         try:
-            print("started")
+            self.logger.info("started")
 
             self.logger.info('Audio Stream started')
             
             self.play_sound("/home/beep/beep-assistant/audio/startup.wav")
             last_speech = datetime.utcnow()        
             record = False
-            responder = mp.Process(target = self.record_callback)
+            wake_detected = datetime.utcnow()
+            responder = mp.Process(name= 'Responder', target = self.record_callback)
             responder.start()
+            
+            self.detectionVolume = self.avg_volume(5) + self.dBthreshold
+            self.logger.info(f'detectionVolume {self.detectionVolume}')
             while True:
                 now = datetime.utcnow()
+                delta = now - last_speech
                 raw_data = self.stream.read(self.CHUNK, exception_on_overflow = False)
                 audio_data = struct.unpack_from("h" * self.CHUNK, raw_data)
                 keyword_index = self.porcupine.process(audio_data)
+                if (now - last_speech) % timedelta(seconds=5) == timedelta(seconds=0):
+                    print("listening")
                 if keyword_index >= 0:
-                    print("wake word detected")
+                    self.logger.info("wake word detected")
+                    print("wake detected")
                     record = True
                     last_speech = now
+                    wake_detected = now
                     responder.terminate()
                     self.play_sound("/home/beep/beep-assistant/audio/beep-07a.wav")
-                if self.isSpeech(raw_data) and record:
-                    print(".", end="")
+                elif (delta > timedelta(seconds=self.speech_buffer_seconds) or now - wake_detected > timedelta(seconds=self.max_input_seconds)) and record:
+                    self.logger.info("starting to record")
+                    record = False
+                    responder = mp.Process(name='Responder', target=self.record_callback)
+                    responder.start()
+                elif self.isSpeech(raw_data) and record:
+                    self.logger.info(".")
                     last_speech = now
                     self.put(raw_data)
-                if now - last_speech > timedelta(seconds=2) and record:
-                    print("starting to record")
-                    record = False
-                    responder = mp.Process(target=self.record_callback)
-                    responder.start()
+
         except Exception as e:
-            self.logger.warning(e)
+            self.logger.exception(e)
+            os.system(f'espeak {e}')
+            #self.play_sound("/home/beep/beep-assistant/audio/error.wav")
         finally:
             self.logger.warning('Audio Stream Loop exited')
             self.stream.close()
@@ -130,9 +159,9 @@ class Beep:
 
     def record_callback(self):
         try:
+            self.logger.info('Started Processing process')
             if not self.empty():
-                self.logger.info('Started Processing process')
-                print("started recording")
+                self.logger.info("Writing audio")
                 clip = []
                 frames = 0
                 while not self.empty():
@@ -150,9 +179,8 @@ class Beep:
         except Exception as e:
             self.logger.warning(e)
             self.play_sound("/home/beep/beep-assistant/audio/error.wav")
-
         finally:
-            self.logger.warning('processing process exited')
+            self.logger.warning('writing stopped')
 
     def transcribe(self, file):
         try:
@@ -165,7 +193,6 @@ class Beep:
         except Exception as e:
             self.logger.warning(e)
             self.play_sound("/home/beep/beep-assistant/audio/error.wav")
-
         finally:
             self.logger.warning('transcription exited')
  
@@ -200,7 +227,7 @@ class Beep:
         except Exception as e:
             self.logger.warning(e)
             self.play_sound("/home/beep/beep-assistant/audio/error.wav")
-
+            
         finally:
             self.logger.warning('response exited')
 
@@ -234,6 +261,7 @@ class Beep:
         except Exception as e:
             self.logger.warning(e)
             self.play_sound("/home/beep/beep-assistant/audio/error.wav")
+            
         finally:
             self.logger.info('output closed')
     def play_sound(self, wavfile):
@@ -244,6 +272,7 @@ class Beep:
             self.stream_out.write(data)
         except Exception as e:
             self.logger.warning(e)
+            
         finally:
             self.logger.info("sound played")
 
@@ -258,5 +287,5 @@ if __name__ == '__main__':
     openai.api_key = os.getenv("OPENAI_API_KEY")
     
     os.system(f'GOOGLE_APPLICATION_CREDENTIALS={GOOGLE_APPLICATION_CREDENTIALS}')
-    beep = Beep(dBthreshold=50)
+    beep = Beep()
     beep.start()
